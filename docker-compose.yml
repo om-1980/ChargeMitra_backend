@@ -1,0 +1,84 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: chargemitra_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: charge_mitra
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5433:5432"
+    volumes:
+      - chargemitra_pgdata:/var/lib/postgresql/data
+      - ./migrations/postgres/001_init_schema.sql:/docker-entrypoint-initdb.d/001_init_schema.sql:ro
+      - ./migrations/postgres/002_meter_values.sql:/docker-entrypoint-initdb.d/002_meter_values.sql:ro
+      - ./migrations/postgres/003_ocpp_transaction_id.sql:/docker-entrypoint-initdb.d/003_ocpp_transaction_id.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d charge_mitra"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    container_name: chargemitra_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: chargemitra_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+
+  ocpp:
+    build:
+      context: .
+      dockerfile: apps/ocpp/Dockerfile
+    container_name: chargemitra_ocpp
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    env_file:
+      - .env
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    container_name: chargemitra_worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8082:8082"
+    env_file:
+      - .env
+
+volumes:
+  chargemitra_pgdata:
