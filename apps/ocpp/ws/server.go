@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
@@ -10,6 +11,13 @@ import (
 
 	"github.com/om-1980/ChargeMitra_backend/internal/ocppcore"
 	"github.com/om-1980/ChargeMitra_backend/pkg/logger"
+)
+
+const (
+	readWait       = 180 * time.Second
+	writeWait      = 10 * time.Second
+	pingPeriod     = 50 * time.Second
+	maxMessageSize = 1024 * 1024
 )
 
 type Server struct {
@@ -56,26 +64,78 @@ func (s *Server) HandleChargePoint(c *gin.Context) {
 
 	s.log.Infof("charger connected: ocpp_id=%s remote=%s", ocppID, c.Request.RemoteAddr)
 
+	done := make(chan struct{})
+	stopPinger := func() {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
+
 	defer func() {
+		stopPinger()
 		s.service.Hub().Remove(ocppID)
 		_ = s.service.MarkOffline(ocppID)
+		_ = writeCloseFrame(conn)
 		_ = client.Close()
 		s.log.Infof("charger disconnected: ocpp_id=%s", ocppID)
 	}()
 
-	conn.SetReadLimit(1024 * 1024)
-	_ = conn.SetReadDeadline(time.Now().Add(120 * time.Second))
-	conn.SetPongHandler(func(string) error {
-		_ = conn.SetReadDeadline(time.Now().Add(120 * time.Second))
-		return s.service.TouchHeartbeat(ocppID)
+	conn.SetReadLimit(maxMessageSize)
+	_ = conn.SetReadDeadline(time.Now().Add(readWait))
+
+	conn.SetPongHandler(func(appData string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(readWait))
+		if err := s.service.TouchHeartbeat(ocppID); err != nil {
+			s.log.Errorf("failed to update heartbeat on pong for %s: %v", ocppID, err)
+		}
+		return nil
 	})
+
+	conn.SetPingHandler(func(appData string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(readWait))
+		if err := s.service.TouchHeartbeat(ocppID); err != nil {
+			s.log.Errorf("failed to update heartbeat on ping for %s: %v", ocppID, err)
+		}
+
+		_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(writeWait))
+	})
+
+	go func() {
+		ticker := time.NewTicker(pingPeriod)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+				if err := conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(writeWait)); err != nil {
+					s.log.Errorf("failed to send ping to %s: %v", ocppID, err)
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+	}()
 
 	for {
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
-			s.log.Errorf("read failed for %s: %v", ocppID, err)
+			stopPinger()
+
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
+				s.log.Errorf("read failed for %s: %v", ocppID, err)
+			} else {
+				s.log.Infof("connection closed for %s: %v", ocppID, err)
+			}
 			break
 		}
+
+		_ = conn.SetReadDeadline(time.Now().Add(readWait))
 
 		if messageType != websocket.TextMessage {
 			s.log.Errorf("unsupported websocket message type for %s: %d", ocppID, messageType)
@@ -92,41 +152,142 @@ func (s *Server) HandleChargePoint(c *gin.Context) {
 
 		s.log.Infof("incoming OCPP frame from %s: %s", ocppID, string(message))
 
-		call, err := ocppcore.ParseOCPPCall(message)
+		msg, err := ocppcore.ParseOCPPMessage(message)
 		if err != nil {
+			_ = s.service.SaveOCPPEvent(
+				ocppID,
+				"incoming",
+				"PARSE_ERROR",
+				"",
+				nil,
+				string(message),
+			)
+
 			s.log.Errorf("failed to parse OCPP frame from %s: %v", ocppID, err)
 
 			errorFrame, buildErr := ocppcore.BuildCallError(
 				"",
 				"FormationViolation",
-				"invalid OCPP CALL frame",
+				"invalid OCPP frame",
 				nil,
 			)
 			if buildErr == nil {
+				_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 				_ = client.WriteMessage(websocket.TextMessage, errorFrame)
 			}
 			continue
 		}
 
-		responseFrame, err := s.service.HandleCall(ocppID, call)
-		if err != nil {
-			s.log.Errorf("failed to handle OCPP action %s for %s: %v", call.Action, ocppID, err)
+		switch msg.MessageType {
+		case ocppcore.MessageTypeCall:
+			var parsedPayload interface{}
+			_ = json.Unmarshal(msg.Payload, &parsedPayload)
 
-			errorFrame, buildErr := ocppcore.BuildCallError(
+			_ = s.service.SaveOCPPEvent(
+				ocppID,
+				"incoming",
+				msg.Action,
+				msg.MessageID,
+				parsedPayload,
+				string(message),
+			)
+
+			call := &ocppcore.OCPPCall{
+				MessageType: msg.MessageType,
+				MessageID:   msg.MessageID,
+				Action:      msg.Action,
+				Payload:     msg.Payload,
+			}
+
+			responseFrame, err := s.service.HandleCall(ocppID, call)
+			if err != nil {
+				s.log.Errorf("failed to handle OCPP action %s for %s: %v", call.Action, ocppID, err)
+
+				errorFrame, buildErr := ocppcore.BuildCallError(
+					call.MessageID,
+					"InternalError",
+					"failed to process request",
+					nil,
+				)
+				if buildErr == nil {
+					_ = s.service.SaveOCPPEvent(
+						ocppID,
+						"outgoing",
+						call.Action+".error",
+						call.MessageID,
+						nil,
+						string(errorFrame),
+					)
+
+					_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+					_ = client.WriteMessage(websocket.TextMessage, errorFrame)
+				}
+				continue
+			}
+
+			_ = s.service.SaveOCPPEvent(
+				ocppID,
+				"outgoing",
+				call.Action+".conf",
 				call.MessageID,
-				"InternalError",
-				"failed to process request",
 				nil,
+				string(responseFrame),
 			)
-			if buildErr == nil {
-				_ = client.WriteMessage(websocket.TextMessage, errorFrame)
-			}
-			continue
-		}
 
-		if err := client.WriteMessage(websocket.TextMessage, responseFrame); err != nil {
-			s.log.Errorf("failed to write OCPP response for %s: %v", ocppID, err)
-			break
+			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := client.WriteMessage(websocket.TextMessage, responseFrame); err != nil {
+				s.log.Errorf("failed to write OCPP response for %s: %v", ocppID, err)
+				stopPinger()
+				break
+			}
+
+		case ocppcore.MessageTypeCallResult:
+			var resultPayload interface{}
+			_ = json.Unmarshal(msg.Payload, &resultPayload)
+
+			resolvedAction := s.service.ResolveResponseAction(ocppID, msg.MessageID, "CALLRESULT")
+
+			_ = s.service.SaveOCPPEvent(
+				ocppID,
+				"incoming",
+				resolvedAction,
+				msg.MessageID,
+				resultPayload,
+				string(message),
+			)
+
+			s.log.Infof("incoming CALLRESULT from %s: message_id=%s resolved_action=%s",
+				ocppID, msg.MessageID, resolvedAction)
+
+		case ocppcore.MessageTypeCallError:
+			payload := map[string]interface{}{
+				"error_code":        msg.ErrorCode,
+				"error_description": msg.ErrorDescription,
+				"details":           msg.ErrorDetails,
+			}
+
+			resolvedAction := s.service.ResolveErrorAction(ocppID, msg.MessageID, "CALLERROR")
+
+			_ = s.service.SaveOCPPEvent(
+				ocppID,
+				"incoming",
+				resolvedAction,
+				msg.MessageID,
+				payload,
+				string(message),
+			)
+
+			s.log.Errorf("incoming CALLERROR from %s: message_id=%s resolved_action=%s error_code=%s description=%s",
+				ocppID, msg.MessageID, resolvedAction, msg.ErrorCode, msg.ErrorDescription)
 		}
 	}
+}
+
+func writeCloseFrame(conn *websocket.Conn) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+	return conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, "closing connection"),
+		time.Now().Add(writeWait),
+	)
 }

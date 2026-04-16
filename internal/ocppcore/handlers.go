@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -137,6 +138,9 @@ func (s *Service) handleStartTransaction(ocppID string, call *OCPPCall) ([]byte,
 		return BuildCallError(call.MessageID, "FormationViolation", "invalid StartTransaction payload", nil)
 	}
 
+	log.Printf("[OCPP] StartTransaction received ocpp_id=%s connector_id=%d idTag=%s meter_start=%d",
+		ocppID, req.ConnectorID, req.IDTag, req.MeterStart)
+
 	chargerID, err := s.GetChargerIDByOCPPID(ocppID)
 	if err != nil {
 		return BuildCallError(call.MessageID, "InternalError", "charger lookup failed", nil)
@@ -167,24 +171,42 @@ func (s *Service) handleStartTransaction(ocppID string, call *OCPPCall) ([]byte,
 		}
 	}
 
+	var sessionID string
 	var ocppTransactionID int64
+
 	err = s.db.QueryRow(ctx, `
 		INSERT INTO charging_sessions (
-			user_id, charger_id, station_id, status,
-			meter_start, energy_kwh, amount, started_at, created_at, updated_at
+			user_id,
+			charger_id,
+			station_id,
+			connector_id,
+			id_tag,
+			status,
+			meter_start,
+			energy_kwh,
+			amount,
+			started_at,
+			created_at,
+			updated_at
 		)
-		VALUES ($1,$2,$3,'in_progress',$4,0,0,$5,NOW(),NOW())
-		RETURNING ocpp_transaction_id
+		VALUES ($1,$2,$3,$4,$5,'in_progress',$6,0,0,$7,NOW(),NOW())
+		RETURNING id, ocpp_transaction_id
 	`,
 		nullStringValue(userID),
 		chargerID,
 		stationID,
+		req.ConnectorID,
+		nullIfEmpty(req.IDTag),
 		float64(req.MeterStart),
 		txTime,
-	).Scan(&ocppTransactionID)
+	).Scan(&sessionID, &ocppTransactionID)
 	if err != nil {
+		log.Printf("[OCPP] StartTransaction insert failed ocpp_id=%s err=%v", ocppID, err)
 		return BuildCallError(call.MessageID, "InternalError", "failed to create charging session", nil)
 	}
+
+	log.Printf("[OCPP] StartTransaction session created ocpp_id=%s session_id=%s ocpp_transaction_id=%d",
+		ocppID, sessionID, ocppTransactionID)
 
 	_, _ = s.db.Exec(ctx, `
 		UPDATE chargers
@@ -210,10 +232,8 @@ func (s *Service) handleMeterValues(ocppID string, call *OCPPCall) ([]byte, erro
 		return BuildCallError(call.MessageID, "FormationViolation", "invalid MeterValues payload", nil)
 	}
 
-	sessionID, err := s.GetSessionUUIDByOCPPTransactionID(req.TransactionID)
-	if err != nil {
-		return BuildCallError(call.MessageID, "PropertyConstraintViolation", "transaction not found", nil)
-	}
+	log.Printf("[OCPP] MeterValues received ocpp_id=%s transaction_id=%d connector_id=%d entries=%d",
+		ocppID, req.TransactionID, req.ConnectorID, len(req.MeterValue))
 
 	chargerID, err := s.GetChargerIDByOCPPID(ocppID)
 	if err != nil {
@@ -222,6 +242,23 @@ func (s *Service) handleMeterValues(ocppID string, call *OCPPCall) ([]byte, erro
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	var sessionID string
+	var meterStart sql.NullFloat64
+
+	err = s.db.QueryRow(ctx, `
+		SELECT id, meter_start
+		FROM charging_sessions
+		WHERE ocpp_transaction_id = $1
+		LIMIT 1
+	`, req.TransactionID).Scan(&sessionID, &meterStart)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Printf("[OCPP] MeterValues session not found ocpp_id=%s transaction_id=%d", ocppID, req.TransactionID)
+			return BuildCallError(call.MessageID, "PropertyConstraintViolation", "transaction not found", nil)
+		}
+		return BuildCallError(call.MessageID, "InternalError", "failed to load session", nil)
+	}
 
 	var latestWh float64
 
@@ -239,24 +276,32 @@ func (s *Service) handleMeterValues(ocppID string, call *OCPPCall) ([]byte, erro
 				continue
 			}
 
-			measurand := sv.Measurand
+			measurand := strings.TrimSpace(sv.Measurand)
 			if measurand == "" {
 				measurand = "Energy.Active.Import.Register"
 			}
 
-			unit := sv.Unit
+			unit := strings.TrimSpace(sv.Unit)
 			if unit == "" {
 				unit = "Wh"
 			}
 
 			_, err = s.db.Exec(ctx, `
 				INSERT INTO meter_values (
-					session_id, charger_id, sampled_at, measurand, value, unit, context
+					session_id,
+					charger_id,
+					ocpp_transaction_id,
+					sampled_at,
+					measurand,
+					value,
+					unit,
+					context
 				)
-				VALUES ($1,$2,$3,$4,$5,$6,$7)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
 			`,
 				sessionID,
 				chargerID,
+				req.TransactionID,
 				sampledAt,
 				measurand,
 				val,
@@ -264,6 +309,8 @@ func (s *Service) handleMeterValues(ocppID string, call *OCPPCall) ([]byte, erro
 				nullIfEmpty(sv.Context),
 			)
 			if err != nil {
+				log.Printf("[OCPP] MeterValues insert failed ocpp_id=%s transaction_id=%d err=%v",
+					ocppID, req.TransactionID, err)
 				return BuildCallError(call.MessageID, "InternalError", "failed to store meter values", nil)
 			}
 
@@ -277,27 +324,19 @@ func (s *Service) handleMeterValues(ocppID string, call *OCPPCall) ([]byte, erro
 		}
 	}
 
-	if latestWh > 0 {
-		var meterStart sql.NullFloat64
-		err = s.db.QueryRow(ctx, `
-			SELECT meter_start
-			FROM charging_sessions
-			WHERE id = $1
-		`, sessionID).Scan(&meterStart)
-		if err == nil && meterStart.Valid {
-			energyKWh := (latestWh - meterStart.Float64) / 1000
-			if energyKWh < 0 {
-				energyKWh = 0
-			}
-
-			_, _ = s.db.Exec(ctx, `
-				UPDATE charging_sessions
-				SET meter_stop = $2,
-				    energy_kwh = $3,
-				    updated_at = NOW()
-				WHERE id = $1
-			`, sessionID, latestWh, energyKWh)
+	if latestWh > 0 && meterStart.Valid {
+		energyKWh := (latestWh - meterStart.Float64) / 1000
+		if energyKWh < 0 {
+			energyKWh = 0
 		}
+
+		_, _ = s.db.Exec(ctx, `
+			UPDATE charging_sessions
+			SET meter_stop = $2,
+			    energy_kwh = $3,
+			    updated_at = NOW()
+			WHERE id = $1
+		`, sessionID, latestWh, energyKWh)
 	}
 
 	resp := map[string]interface{}{}
@@ -310,10 +349,8 @@ func (s *Service) handleStopTransaction(ocppID string, call *OCPPCall) ([]byte, 
 		return BuildCallError(call.MessageID, "FormationViolation", "invalid StopTransaction payload", nil)
 	}
 
-	sessionID, err := s.GetSessionUUIDByOCPPTransactionID(req.TransactionID)
-	if err != nil {
-		return BuildCallError(call.MessageID, "PropertyConstraintViolation", "transaction not found", nil)
-	}
+	log.Printf("[OCPP] StopTransaction received ocpp_id=%s transaction_id=%d meter_stop=%d reason=%s",
+		ocppID, req.TransactionID, req.MeterStop, req.Reason)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -325,14 +362,21 @@ func (s *Service) handleStopTransaction(ocppID string, call *OCPPCall) ([]byte, 
 		}
 	}
 
+	var sessionID string
 	var meterStart sql.NullFloat64
-	err = s.db.QueryRow(ctx, `
-		SELECT meter_start
+
+	err := s.db.QueryRow(ctx, `
+		SELECT id, meter_start
 		FROM charging_sessions
-		WHERE id = $1
-	`, sessionID).Scan(&meterStart)
+		WHERE ocpp_transaction_id = $1
+		LIMIT 1
+	`, req.TransactionID).Scan(&sessionID, &meterStart)
 	if err != nil {
-		return BuildCallError(call.MessageID, "PropertyConstraintViolation", "transaction not found", nil)
+		if err == sql.ErrNoRows {
+			log.Printf("[OCPP] StopTransaction session not found ocpp_id=%s transaction_id=%d", ocppID, req.TransactionID)
+			return BuildCallError(call.MessageID, "PropertyConstraintViolation", "transaction not found", nil)
+		}
+		return BuildCallError(call.MessageID, "InternalError", "failed to load session", nil)
 	}
 
 	meterStop := float64(req.MeterStop)
@@ -358,6 +402,8 @@ func (s *Service) handleStopTransaction(ocppID string, call *OCPPCall) ([]byte, 
 		WHERE id = $1
 	`, sessionID, meterStop, energyKWh, amount, stopTime, nullIfEmpty(req.Reason))
 	if err != nil {
+		log.Printf("[OCPP] StopTransaction update failed ocpp_id=%s transaction_id=%d err=%v",
+			ocppID, req.TransactionID, err)
 		return BuildCallError(call.MessageID, "InternalError", "failed to stop transaction", nil)
 	}
 

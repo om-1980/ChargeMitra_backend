@@ -6,14 +6,14 @@ import (
 	"fmt"
 )
 
-func ParseOCPPCall(raw []byte) (*OCPPCall, error) {
+func ParseOCPPMessage(raw []byte) (*OCPPMessage, error) {
 	var arr []json.RawMessage
 	if err := json.Unmarshal(raw, &arr); err != nil {
 		return nil, fmt.Errorf("invalid json frame: %w", err)
 	}
 
-	if len(arr) < 4 {
-		return nil, errors.New("invalid ocpp call frame length")
+	if len(arr) < 3 {
+		return nil, errors.New("invalid ocpp frame length")
 	}
 
 	var messageType int
@@ -21,26 +21,81 @@ func ParseOCPPCall(raw []byte) (*OCPPCall, error) {
 		return nil, errors.New("invalid message type")
 	}
 
-	if messageType != MessageTypeCall {
-		return nil, fmt.Errorf("unsupported message type: %d", messageType)
-	}
-
 	var messageID string
 	if err := json.Unmarshal(arr[1], &messageID); err != nil {
 		return nil, errors.New("invalid message id")
 	}
 
-	var action string
-	if err := json.Unmarshal(arr[2], &action); err != nil {
-		return nil, errors.New("invalid action")
+	msg := &OCPPMessage{
+		MessageType: messageType,
+		MessageID:   messageID,
+	}
+
+	switch messageType {
+	case MessageTypeCall:
+		if len(arr) < 4 {
+			return nil, errors.New("invalid ocpp call frame length")
+		}
+
+		var action string
+		if err := json.Unmarshal(arr[2], &action); err != nil {
+			return nil, errors.New("invalid action")
+		}
+
+		msg.Action = action
+		msg.Payload = arr[3]
+		return msg, nil
+
+	case MessageTypeCallResult:
+		msg.Action = "CALLRESULT"
+		msg.Payload = arr[2]
+		return msg, nil
+
+	case MessageTypeCallError:
+		if len(arr) < 5 {
+			return nil, errors.New("invalid ocpp call error frame length")
+		}
+
+		if err := json.Unmarshal(arr[2], &msg.ErrorCode); err != nil {
+			return nil, errors.New("invalid error code")
+		}
+		if err := json.Unmarshal(arr[3], &msg.ErrorDescription); err != nil {
+			return nil, errors.New("invalid error description")
+		}
+		_ = json.Unmarshal(arr[4], &msg.ErrorDetails)
+		msg.Action = "CALLERROR"
+		return msg, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported message type: %d", messageType)
+	}
+}
+
+func ParseOCPPCall(raw []byte) (*OCPPCall, error) {
+	msg, err := ParseOCPPMessage(raw)
+	if err != nil {
+		return nil, err
+	}
+	if msg.MessageType != MessageTypeCall {
+		return nil, fmt.Errorf("unsupported message type for call parser: %d", msg.MessageType)
 	}
 
 	return &OCPPCall{
-		MessageType: messageType,
-		MessageID:   messageID,
-		Action:      action,
-		Payload:     arr[3],
+		MessageType: msg.MessageType,
+		MessageID:   msg.MessageID,
+		Action:      msg.Action,
+		Payload:     msg.Payload,
 	}, nil
+}
+
+func BuildCall(messageID, action string, payload interface{}) ([]byte, error) {
+	frame := []interface{}{
+		MessageTypeCall,
+		messageID,
+		action,
+		payload,
+	}
+	return json.Marshal(frame)
 }
 
 func BuildCallResult(messageID string, payload interface{}) ([]byte, error) {

@@ -24,6 +24,16 @@ type ChargerConnectionInfo struct {
 	IsOnline    bool      `json:"is_online"`
 }
 
+type OCPPMessage struct {
+	MessageType      int
+	MessageID        string
+	Action           string
+	Payload          json.RawMessage
+	ErrorCode        string
+	ErrorDescription string
+	ErrorDetails     map[string]interface{}
+}
+
 type OCPPCall struct {
 	MessageType int
 	MessageID   string

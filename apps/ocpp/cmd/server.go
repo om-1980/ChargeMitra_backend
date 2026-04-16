@@ -33,6 +33,7 @@ func NewServer(cfg *appconfig.Config, log *logger.Logger, db *pgxpool.Pool, redi
 	hub := ocppcore.NewHub()
 	ocppService := ocppcore.NewService(db, redisClient, hub)
 	wsServer := ws.NewServer(log, ocppService)
+	apiHandler := ocppcore.NewAPIHandler(ocppService)
 
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
@@ -43,11 +44,18 @@ func NewServer(cfg *appconfig.Config, log *logger.Logger, db *pgxpool.Pool, redi
 
 	router.GET("/ws/:ocppId", wsServer.HandleChargePoint)
 
-	router.GET("/connections", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"connections": hub.List(),
+	protected := router.Group("/")
+	protected.Use(ocppcore.RequireControlToken())
+	{
+		protected.GET("/connections", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{
+				"connections": hub.List(),
+			})
 		})
-	})
+
+		protected.POST("/control/remote-start", apiHandler.RemoteStart)
+		protected.POST("/control/remote-stop", apiHandler.RemoteStop)
+	}
 
 	return &Server{
 		Config: cfg,

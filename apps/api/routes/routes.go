@@ -13,6 +13,7 @@ import (
 	"github.com/om-1980/ChargeMitra_backend/internal/stations"
 	"github.com/om-1980/ChargeMitra_backend/internal/users"
 	"github.com/om-1980/ChargeMitra_backend/pkg/response"
+	"github.com/om-1980/ChargeMitra_backend/internal/ocppcore"
 )
 
 func Register(router *gin.Engine, db *pgxpool.Pool, cfg *configs.Config) {
@@ -27,6 +28,8 @@ func Register(router *gin.Engine, db *pgxpool.Pool, cfg *configs.Config) {
 	userHandler := users.NewHandler(db)
 	stationHandler := stations.NewHandler(db)
 	chargerHandler := chargers.NewHandler(db)
+	ocppService := ocppcore.NewService(db, nil, nil)
+	ocppAPI := ocppcore.NewAPIHandler(ocppService)
 
 	v1 := router.Group("/api/v1")
 	{
@@ -74,13 +77,15 @@ func Register(router *gin.Engine, db *pgxpool.Pool, cfg *configs.Config) {
 		}
 
 		admin := v1.Group("/admin")
-		admin.Use(middleware.JWTAuth(cfg.JWTSecret), middleware.RequireRoles("admin"))
+		admin.Use(middleware.JWTAuth(cfg.JWTSecret), middleware.RequireRoles("admin", "owner"))
 		{
 			admin.GET("/health", func(c *gin.Context) {
 				response.Success(c, http.StatusOK, "admin route accessible", gin.H{
 					"role": "admin",
 				})
 			})
+			admin.GET("/ocpp/events", ocppAPI.ListEvents)
+			admin.GET("/ocpp/summary/:ocppId", ocppAPI.Summary)
 		}
 	}
 }

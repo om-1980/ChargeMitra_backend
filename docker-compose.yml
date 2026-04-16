@@ -14,6 +14,9 @@ services:
       - ./migrations/postgres/001_init_schema.sql:/docker-entrypoint-initdb.d/001_init_schema.sql:ro
       - ./migrations/postgres/002_meter_values.sql:/docker-entrypoint-initdb.d/002_meter_values.sql:ro
       - ./migrations/postgres/003_ocpp_transaction_id.sql:/docker-entrypoint-initdb.d/003_ocpp_transaction_id.sql:ro
+      - ./migrations/postgres/004_meter_values_ocpp_transaction_id.sql:/docker-entrypoint-initdb.d/004_meter_values_ocpp_transaction_id.sql:ro
+      - ./migrations/postgres/005_charging_sessions_connector_id_id_tag.sql:/docker-entrypoint-initdb.d/005_charging_sessions_connector_id_id_tag.sql:ro
+      - ./migrations/postgres/006_ocpp_events.sql:/docker-entrypoint-initdb.d/006_ocpp_events.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d charge_mitra"]
       interval: 5s
